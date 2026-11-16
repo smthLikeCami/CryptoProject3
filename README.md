@@ -36,8 +36,28 @@ Start the server, then use another terminal to submit a ballot:
 ```
 
 Enter a voter name and the password printed by the server, then the write-in
-text. The client encrypts the text with the shared election public key before
-sending it with the credentials to `POST /submit_ballot`.
+text. The client encrypts the text with the shared election public key and
+displays the prepared ciphertext's hash. Then choose `cast` or `audit`:
+
+- `cast` submits that exact ciphertext with the credentials to
+  `POST /submit_ballot`. The plaintext and random exponents are not sent.
+- `audit` reveals the plaintext and each block's random exponent in the terminal,
+  then checks the saved ciphertext against the public key and both ElGamal
+  encryption equations. It also checks the previously displayed hash.
+  The audited ballot is discarded, whether the check passes or fails, and no
+  submission request is made. Run the script again for fresh encryption before
+  casting. Auditing therefore does not consume the voter's one submission.
+
+This is a local Helios-style cast-or-audit check of ballot preparation. It does
+not verify the server's complete election record, tally, or mixnet proofs; those
+checks are reserved for the later `verify.py` step. Discarding audited ballots
+is enforced by this client flow; the server does not yet track spoiled ballots.
+
+Run the audit regression tests with:
+
+```bash
+.venv/bin/python -m unittest discover -s client -p 'test_*.py' -v
+```
 
 The server stores the ciphertext string unchanged and returns its SHA-256 hash
 in `{"hash": "..."}`. The client checks that hash against the ciphertext it sent
