@@ -1,1 +1,6 @@
 requests>=2.32,<3
+tno.mpc.encryption_schemes.elgamal[communication]==1.1.5
+# Utils 0.16 uses communication 5.x; this version works with ElGamal's 4.x API.
+# The gmpy extra accelerates arithmetic without reducing security.
+tno.mpc.encryption_schemes.utils[communication,gmpy]==0.15.0
+tno.mpc.communication>=4,<5

@@ -1,0 +1,5 @@
+tno.mpc.encryption_schemes.elgamal[communication]==1.1.5
+# Utils 0.16 uses communication 5.x; keep the compatible version explicitly.
+# GMPY2 speeds up key generation and arithmetic without weakening the key.
+tno.mpc.encryption_schemes.utils[communication,gmpy]==0.15.0
+tno.mpc.communication>=4,<5
