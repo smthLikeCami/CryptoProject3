@@ -1,0 +1,38 @@
+# Local Python environment and generated caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+
+# Generated election keys, shares, and registration data
+/trustee/threshold/
+/client/signing_keys/
+/server/voter_keys.json
+*.pem
+*.key
+*.bin
+
+# Local credentials and agent configuration
+.env
+.env.*
+!.env.example
+/.aws/
+/.codex/
+/.agents/
+
+# Editor locks and operating-system files
+.~lock.*#
+~$*
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
