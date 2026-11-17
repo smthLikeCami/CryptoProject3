@@ -68,13 +68,19 @@ def _print_authenticated_users():
         seen_names.add(name)
 
     voter_hashes.clear()
+    passwords = {}
 
     for name in names:
         password = secrets.token_urlsafe(16)
         voter_hashes[name] = generate_password_hash(password)
+        passwords[name] = password
 
         # For this prototype, display passwords instead of emailing them.
         print(f"Voter: {name} | Password: {password}", flush=True)
+
+    # The mock-election runner uses this to simulate delivering credentials.
+    # Normal server startup ignores the return value.
+    return passwords
 
 
 def _start_server():

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from tno.mpc.communication import Serialization
 from tno.mpc.encryption_schemes.elgamal.elgamal import ElGamal, ElGamalCipherText
@@ -19,11 +20,13 @@ from werkzeug.security import generate_password_hash
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from client.submit_ballot import _prepare_ballot
+from client.verify import verify_election
 from server import server
 from server.shuffle import (BALLOT_FORMAT, count_votes, create_decryption, create_shuffle,
                             decode_vote, election_rows, encode_vote, hash_record,
                             validate_key, verify_decryption, verify_shuffle)
 from trustee import decrypt_ballots as trustee
+import mock_election
 
 
 class ElectionTests(unittest.TestCase):
@@ -245,6 +248,104 @@ class ElectionTests(unittest.TestCase):
         with patch("builtins.input", side_effect=["close", EOFError]), patch.object(server, "_close_election") as close, redirect_stdout(StringIO()):
             server._read_commands()
         close.assert_called_once()
+
+    def finished_election(self):
+        """Build a public record from the real proofs in this test fixture."""
+        decryption = deepcopy(self.decryption)
+        decryption["record_hash"] = self.record_hash
+        return {
+            "state": "tallied",
+            "record": {"context": deepcopy(self.context), "shuffle": deepcopy(self.shuffle),
+                       "record_hash": self.record_hash},
+            "result": {"decryption": decryption, "tally": count_votes(decryption["messages"])},
+        }
+
+    def test_client_verifies_receipt_proofs_and_tally(self):
+        election = self.finished_election()
+        tally = verify_election(election, self.public_data, self.entries[0]["hash"], report=lambda _: None)
+        self.assertEqual(tally["counts"], {"Alice": 2, "Bob": 1, "😀" * 32: 1})
+
+    def test_client_rejects_missing_receipt_or_untrusted_key(self):
+        election = self.finished_election()
+        with self.assertRaisesRegex(ValueError, "receipt is missing"):
+            verify_election(election, self.public_data, "0" * 64, report=lambda _: None)
+        with self.assertRaisesRegex(ValueError, "trusted public key"):
+            verify_election(election, b"different public key", report=lambda _: None)
+        election["state"] = "awaiting_trustee"
+        with self.assertRaisesRegex(ValueError, "not finished"):
+            verify_election(election, self.public_data, report=lambda _: None)
+
+    def test_client_rejects_false_published_tally(self):
+        election = self.finished_election()
+        election["result"]["tally"]["counts"]["Alice"] = 100
+        with self.assertRaisesRegex(ValueError, "published tally"):
+            verify_election(election, self.public_data, report=lambda _: None)
+
+    def test_client_rejects_tampered_shuffle_even_with_new_record_hash(self):
+        election = self.finished_election()
+        record = election["record"]
+        record["shuffle"]["output"][0][0][1] = "1"
+        record["record_hash"] = hash_record({"context": record["context"], "shuffle": record["shuffle"]})
+        with self.assertRaisesRegex(ValueError, "shuffle proof"):
+            verify_election(election, self.public_data, report=lambda _: None)
+
+    def test_client_rejects_tampered_decryption(self):
+        election = self.finished_election()
+        election["result"]["decryption"]["messages"][0][0] = "1"
+        with self.assertRaisesRegex(ValueError, "decryption proof"):
+            verify_election(election, self.public_data, report=lambda _: None)
+
+    def test_mock_roles_complete_election_without_a_network_socket(self):
+        """Exercise the demo roles through real Flask routes in this restricted sandbox."""
+        class Response:
+            def __init__(self, response):
+                self.response = response
+                self.status_code = response.status_code
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise ValueError(self.response.json)
+            def json(self):
+                return self.response.json
+
+        def get(url, timeout):
+            return Response(self.client.get(urlsplit(url).path))
+
+        def post(url, json, timeout):
+            return Response(self.client.post(urlsplit(url).path, json=json))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "client").mkdir()
+            (folder / "trustee").mkdir()
+            (folder / "client" / "trusted_public_key.bin").write_bytes(self.public_data)
+            (folder / "trustee" / "public_key.bin").write_bytes(self.public_data)
+            (folder / "trustee" / "private_key.bin").write_bytes(self.private_data)
+            mock_election.write_json(folder / "demo_votes.json", mock_election.DEMO_VOTES)
+            mock_election.write_json(folder / "server_info.json", {
+                "url": "http://demo.local", "passwords": {name: "password" for name in mock_election.DEMO_VOTES},
+            })
+            output = StringIO()
+            with (
+                patch.object(mock_election.requests, "get", side_effect=get),
+                patch.object(mock_election.requests, "post", side_effect=post),
+                patch.object(trustee, "__file__", str(folder / "trustee" / "decrypt_ballots.py")),
+                redirect_stdout(output),
+            ):
+                with patch("builtins.input", return_value="audit"):
+                    mock_election.worker_client(folder, "Alice")
+                self.assertFalse(server.g_buletin)
+                with patch("builtins.input", return_value="cast"):
+                    for name in mock_election.DEMO_VOTES:
+                        mock_election.worker_client(folder, name)
+                server._close_election()
+                mock_election.worker_trustee(folder)
+                for name in mock_election.DEMO_VOTES:
+                    mock_election.worker_verify(folder, name)
+
+            self.assertEqual(server.election_result["tally"]["counts"], {"River": 3, "Forest": 1})
+            self.assertEqual(output.getvalue().count("Verification complete."), 4)
+            audited = json.loads((folder / "client" / "receipts" / "Alice-audited.json").read_text())
+            self.assertNotIn(audited["receipt"], [entry["hash"] for entry in server.g_buletin])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,31 @@
 # Voting prototype
 
+## Narrated mock election
+
+Run the complete example from the project root:
+
+```bash
+.venv/bin/python mock_election.py
+```
+
+The script creates a temporary workspace and fresh keys, starts a background
+HTTP server on an automatically selected local port, and runs the clients and
+trustee in separate processes. It requires permission to bind a local socket.
+It leaves your existing keys, voter file, and running election untouched.
+
+Alice audits and discards a ballot, then prepares a fresh one to cast. Alice,
+Bob, Chet, and Diane each cast once. The runner sends `close` to the server,
+runs trustee decryption, and has each client verify their receipt, the shuffle
+proof, the decryption proof, and the final count. Step numbers and actor labels
+explain each action. The known mock choices and expected counts are public for
+this demonstration; an actual server receives encrypted ballots only.
+
+Edit `DEMO_VOTES` near the top of `mock_election.py` to change the write-ins.
+The default result is `River: 3, Forest: 1`. On completion or failure, started
+processes are stopped and the temporary files are removed.
+
+## Manual operation
+
 Install the dependencies in your virtual environment:
 
 ```bash
@@ -47,10 +73,10 @@ displays the prepared ciphertext's hash. Then choose `cast` or `audit`:
   submission request is made. Run the script again for fresh encryption before
   casting. Auditing therefore does not consume the voter's one submission.
 
-This is a local Helios-style cast-or-audit check of ballot preparation. It does
-not verify the server's complete election record, tally, or mixnet proofs; those
-checks are reserved for the later `verify.py` step. Discarding audited ballots
-is enforced by this client flow; the server does not yet track spoiled ballots.
+This is a local Helios-style cast-or-audit check of ballot preparation.
+After tallying, `verify.py` checks the public record and proofs as described
+below. Discarding audited ballots is enforced by this client flow; the server
+does not yet track spoiled ballots.
 
 Run the audit and election regression tests with:
 
@@ -103,8 +129,21 @@ in `invalid_ballots`. They are not silently assigned to a candidate.
 
 `GET /election` publishes the state, the frozen input ballots and receipt hashes,
 the shuffled ciphertexts and proof, and, after tallying, the decryption proof and
-counts. It publishes no voter names or passwords. The verifier functions in
-`server/shuffle.py` are available for the future `client/verify.py` command.
+counts. It publishes no voter names or passwords.
+
+To verify a completed election with your saved receipt:
+
+```bash
+.venv/bin/python client/verify.py --receipt YOUR_BALLOT_HASH
+```
+
+The verifier uses the local `trustee/public_key.bin` as its trusted public key.
+For another deployment, use `--server URL --public-key PATH` and obtain that
+public key independently. It never needs a voter password or private key.
+It checks the frozen input hashes, your receipt's inclusion, the entire shuffle
+proof, the trustee decryption proof, and the recomputed tally including invalid
+ballot indices. Without `--receipt`, it checks public evidence but explicitly
+reports that individual inclusion was not checked.
 
 ## Fixed-width text encoding
 
