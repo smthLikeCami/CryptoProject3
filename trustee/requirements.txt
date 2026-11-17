@@ -4,3 +4,4 @@ tno.mpc.encryption_schemes.elgamal[communication]==1.1.5
 tno.mpc.encryption_schemes.utils[communication,gmpy]==0.15.0
 tno.mpc.communication>=4,<5
 requests>=2.32,<3
+cryptography>=41

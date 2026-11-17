@@ -1,7 +1,6 @@
-"""Encrypt a write-in ballot locally and submit it with voter credentials."""
+"""Encrypt a write-in locally, then audit it or sign and submit it."""
 
 import base64
-from getpass import getpass
 import hashlib
 import json
 from pathlib import Path
@@ -16,6 +15,7 @@ from tno.mpc.encryption_schemes.templates.random_sources import ContextlessSourc
 # Share the padded ballot format with the server and trustee scripts.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.shuffle import encode_vote
+from server.authentication import load_signing_key, sign_ballot, validate_roster
 
 
 server_url = "http://127.0.0.1:5000"
@@ -36,9 +36,9 @@ def _prepare_ballot(vote, scheme):
     random_pairs = []
 
     for message in messages:
-        # Match TNO's ElGamal randomness generation, retaining r for auditing.
+        # Choose a fresh exponent in the prime-order subgroup; retain it for auditing.
         # Never print or send these exponents for a ballot that is cast.
-        exponent = secrets.randbelow(key.p - 2) + 1
+        exponent = secrets.randbelow((key.p - 1) // 2 - 1) + 1
         random_values.append(exponent)
         random_pairs.append((pow(key.g, exponent, key.p), pow(key.h, exponent, key.p)))
 
@@ -75,7 +75,7 @@ def _audit_ballot(vote, ballot, random_values, scheme, expected_hash):
     key = scheme.public_key
 
     for block, message, exponent in zip(blocks, messages, random_values):
-        if type(exponent) is not int or not 1 <= exponent <= key.p - 2:
+        if type(exponent) is not int or not 1 <= exponent < (key.p - 1) // 2:
             return False
 
         packed = base64.b64decode(block, validate=True)
@@ -98,7 +98,7 @@ def _audit_ballot(vote, ballot, random_values, scheme, expected_hash):
     return True
 
 
-def _submit_ballot(vote, username, password):
+def _submit_ballot(vote, name, private_file):
     """Prepare a ballot, then either audit and discard it or cast it."""
     if not isinstance(vote, str):
         raise TypeError("The vote must be a string.")
@@ -108,7 +108,8 @@ def _submit_ballot(vote, username, password):
         response.raise_for_status()
 
         # Fetch only the public key. The private key stays with the trustee.
-        public_data = base64.b64decode(response.json()["public_key"], validate=True)
+        setup = response.json()
+        public_data = base64.b64decode(setup["public_key"], validate=True)
         scheme = Serialization.unpack(public_data)[1]
 
         if not isinstance(scheme, ElGamal):
@@ -143,9 +144,18 @@ def _submit_ballot(vote, username, password):
         # The cast branch sends neither the plaintext nor its random exponents.
         random_values.clear()
 
+        # Open the private signing file only when casting, never when auditing.
+        private_file = Path(private_file)
+        roster = json.loads(private_file.with_name("voters.json").read_text(encoding="utf-8"))
+        validate_roster(roster)
+        if roster != setup["voters"]:
+            raise ValueError("Server voter roster differs from the trusted local roster.")
+        signature = sign_ballot(load_signing_key(private_file), setup["election_id"], name, ballot, roster)
+        print("Signed the election ID and ciphertext hash with the voter's Ed25519 key.")
+
         response = requests.post(
             f"{server_url}/submit_ballot",
-            json={"name": username, "password": password, "ballot": ballot},
+            json={"name": name, "election_id": setup["election_id"], "ballot": ballot, "signature": signature},
             timeout=10,
         )
         result = response.json()
@@ -166,15 +176,15 @@ def _submit_ballot(vote, username, password):
 
     except requests.RequestException as error:
         print(f"Could not complete the request: {error}")
-    except (ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"Could not prepare or submit the ballot: {error}")
 
     return None
 
 
 if __name__ == "__main__":
-    username = input("Voter name: ")
-    password = getpass("Password: ")
+    name = input("Voter name: ")
+    private_file = input("Private Ed25519 signing key file: ")
     vote = input("Vote (write-in text, at most 32 characters): ")
 
-    _submit_ballot(vote, username, password)
+    _submit_ballot(vote, name, private_file)

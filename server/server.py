@@ -3,22 +3,26 @@
 import base64
 from copy import deepcopy
 import hashlib
+import json
 from pathlib import Path
 import secrets
 from threading import Lock, Thread
 
 from flask import Flask, jsonify, request
-from werkzeug.security import check_password_hash, generate_password_hash
 from tno.mpc.communication import Serialization
 from tno.mpc.encryption_schemes.elgamal.elgamal import ElGamal
 
 # Support both `python server/server.py` and importing the module in tests.
 if __package__:
     from .shuffle import (BALLOT_FORMAT, count_votes, create_shuffle, election_rows,
-                          hash_record, read_ballot, validate_key, verify_decryption, verify_shuffle)
+                          hash_record, read_ballot, validate_key, verify_shuffle)
+    from .threshold import REQUIRED, combine_partials, validate_manifest, verify_partial
+    from .authentication import validate_roster, verify_authorizations, verify_signature
 else:
     from shuffle import (BALLOT_FORMAT, count_votes, create_shuffle, election_rows,
-                         hash_record, read_ballot, validate_key, verify_decryption, verify_shuffle)
+                         hash_record, read_ballot, validate_key, verify_shuffle)
+    from threshold import REQUIRED, combine_partials, validate_manifest, verify_partial
+    from authentication import validate_roster, verify_authorizations, verify_signature
 
 
 app = Flask(__name__)
@@ -26,8 +30,8 @@ app = Flask(__name__)
 # Resolve the file from this script, regardless of where Python is started.
 voters_file = Path(__file__).resolve().parent / "voters_list.txt"
 
-# Store password hashes, indexed by the exact voter name.
-voter_hashes = {}
+# Only public signing keys are registered with the server.
+voter_roster = None
 
 # Global variable of the bulletin, all ballots being cast
 g_buletin = []
@@ -43,94 +47,30 @@ election_id = secrets.token_hex(16)
 election_state = "open"
 election_record = None
 election_result = None
+trustee_manifest = None
+trustee_partials = {}
 
 
-def _print_authenticated_users():
-    """Load voters, generate new passwords, and print them once at startup."""
+def _load_voters():
+    """Load the public signing roster created by trusted voter setup."""
+    global voter_roster
+    file = Path(__file__).resolve().parent / "voter_keys.json"
     try:
+        roster = json.loads(file.read_text(encoding="utf-8"))
         names = voters_file.read_text(encoding="utf-8").splitlines()
     except OSError as error:
-        raise ValueError(f"Cannot read voters file: {voters_file}") from error
-
-    if not names:
-        raise ValueError("The voters file must contain at least one voter.")
-
-    # Validate the entire list before generating or printing any credentials.
-    seen_names = set()
-
-    for line, name in enumerate(names, start=1):
-        if not name.strip():
-            raise ValueError(f"Empty voter name on line {line}.")
-
-        if name in seen_names:
-            raise ValueError(f"Duplicate voter name on line {line}: {name}")
-
-        seen_names.add(name)
-
-    voter_hashes.clear()
-    passwords = {}
-
-    for name in names:
-        password = secrets.token_urlsafe(16)
-        voter_hashes[name] = generate_password_hash(password)
-        passwords[name] = password
-
-        # For this prototype, display passwords instead of emailing them.
-        print(f"Voter: {name} | Password: {password}", flush=True)
-
-    # The mock-election runner uses this to simulate delivering credentials.
-    # Normal server startup ignores the return value.
-    return passwords
+        raise ValueError("Run client/generate_signing_keys.py before starting the server.") from error
+    validate_roster(roster)
+    if names != [voter["name"] for voter in roster["voters"]]:
+        raise ValueError("Registered signing keys do not match the eligible voter list.")
+    voter_roster = roster
+    print(f"Registered {len(names)} voter public signing keys; no passwords are used.", flush=True)
 
 
 def _start_server():
-    """Listen locally without a reloader that would regenerate passwords."""
+    """Listen locally without restarting the in-memory election automatically."""
     Thread(target=_read_commands, daemon=True).start()
     app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
-
-
-def _check_credentials(name, password):
-    """Check the credentials supplied with an HTTP request."""
-    password_hash = voter_hashes.get(name)
-
-    if password_hash is None:
-        return False
-
-    return check_password_hash(password_hash, password)
-
-
-def _handle_client(request):
-    """Validate the request and authenticate without creating a session."""
-    data = request.get_json(silent=True)
-
-    if not isinstance(data, dict):
-        return _invalid_request()
-
-    name = data.get("name")
-    password = data.get("password")
-
-    if not isinstance(name, str) or not name.strip():
-        return _invalid_request()
-
-    if not isinstance(password, str) or not password.strip():
-        return _invalid_request()
-
-    # Use the same response for unknown voters and incorrect passwords.
-    if not _check_credentials(name, password):
-        return jsonify(error="Invalid name or password"), 401
-
-    return jsonify(message="Authentication successful"), 200
-
-
-def _invalid_request():
-    """Keep the validation response consistent for all invalid input."""
-    return jsonify(error="Expected nonempty name and password strings"), 400
-
-
-@app.post("/authenticate")
-def authenticate():
-    """Accept JSON containing a voter name and password."""
-    return _handle_client(request)
 
 
 @app.get("/public_key")
@@ -139,7 +79,7 @@ def get_public_key():
     if public_scheme is None:
         return jsonify(error="Election public key is not loaded"), 503
 
-    return jsonify(public_key=public_key)
+    return jsonify(public_key=public_key, election_id=election_id, voters=deepcopy(voter_roster))
 
 
 @app.post("/submit_ballot")
@@ -147,27 +87,22 @@ def submit_ballot():
     """Authenticate, store the ciphertext, and return its SHA-256 hash."""
     print("Received a ballot submission.", flush=True)
 
-    # Reuse the same authentication checks as the temporary login endpoint.
-    response, status = _handle_client(request)
-    if status != 200:
-        return response, status
-
-    if public_scheme is None:
-        return jsonify(error="Election public key is not loaded"), 503
-
-    data = request.get_json()
+    if public_scheme is None or voter_roster is None:
+        return jsonify(error="Election setup is not loaded"), 503
+    data = request.get_json(silent=True)
+    fields = ("name", "election_id", "ballot", "signature")
+    if not isinstance(data, dict) or any(not isinstance(data.get(field), str) for field in fields):
+        return jsonify(error="Expected name, election_id, ballot, and signature strings"), 400
     name = data["name"]
-    ballot = data.get("ballot")
-
-    if not isinstance(ballot, str):
-        return jsonify(error="Expected a ballot string"), 400
-
+    ballot = data["ballot"]
     try:
-        ballot_bytes = ballot.encode("utf-8")
+        ballot_hash = hashlib.sha256(ballot.encode("utf-8")).hexdigest()
     except UnicodeEncodeError:
         return jsonify(error="The ballot must be valid UTF-8 text"), 400
-
-    ballot_hash = hashlib.sha256(ballot_bytes).hexdigest()
+    if data["election_id"] != election_id or not verify_signature(
+        election_id, name, ballot, data["signature"], voter_roster
+    ):
+        return jsonify(error="Invalid voter signature or election identifier"), 401
 
     # Validate the fixed-width ciphertext format before accepting it. This does
     # not prove a valid plaintext; invalid encodings are reported after decryption.
@@ -188,7 +123,7 @@ def submit_ballot():
         if any(entry["hash"] == ballot_hash for entry in g_buletin):
             return jsonify(error="This ciphertext has already been submitted"), 409
 
-        g_buletin.append({"ballot": ballot, "hash": ballot_hash})
+        g_buletin.append({"name": name, "ballot": ballot, "hash": ballot_hash, "signature": data["signature"]})
         submitted_voters.add(name)
 
     return jsonify(hash=ballot_hash), 200
@@ -207,10 +142,12 @@ def _close_election():
             return
         election_state = "mixing"
         context = {"election_id": election_id, "public_key": public_key,
-                   "ballot_format": BALLOT_FORMAT, "ballots": deepcopy(g_buletin)}
+                   "ballot_format": BALLOT_FORMAT, "ballots": deepcopy(g_buletin),
+                   "trustees": deepcopy(trustee_manifest), "voters": deepcopy(voter_roster)}
 
     print("Voting closed. Creating the verifiable shuffle...", flush=True)
     try:
+        verify_authorizations(context, voter_roster)
         rows = election_rows(context, public_scheme)
         proof = create_shuffle(rows, public_scheme, context)
         if not verify_shuffle(rows, proof, public_scheme, context):
@@ -219,8 +156,8 @@ def _close_election():
         record["record_hash"] = hash_record(record)
         with ballot_lock:
             election_record = record
-            election_state = "awaiting_trustee"
-        print("Shuffle verified. Run trustee/decrypt_ballots.py to finish tallying.", flush=True)
+            election_state = "awaiting_trustees"
+        print("Shuffle verified. Waiting for partial decryptions from two of three trustees.", flush=True)
     except Exception as error:
         # Stay closed on failure; never silently reopen voting or publish a tally.
         with ballot_lock:
@@ -246,43 +183,58 @@ def _read_commands():
 def get_election():
     """Expose the public record for trustee processing and later verification."""
     with ballot_lock:
-        return jsonify(state=election_state, record=deepcopy(election_record), result=deepcopy(election_result))
+        return jsonify(state=election_state, record=deepcopy(election_record), result=deepcopy(election_result),
+                       trustee_progress={"required": REQUIRED, "received": len(trustee_partials),
+                                         "trustees": sorted(trustee_partials)})
 
 
-@app.post("/trustee/tally")
+@app.post("/trustee/partial_decryption")
 def receive_decryption():
-    """Accept plaintexts only when their proof verifies against the frozen shuffle."""
+    """Verify one trustee's factors; only two distinct trustees unlock a tally."""
     global election_state, election_result
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return jsonify(error="Expected a trustee result object"), 400
+        return jsonify(error="Expected a trustee partial-decryption object"), 400
     with ballot_lock:
-        if election_state != "awaiting_trustee":
+        if election_state != "awaiting_trustees":
             return jsonify(error="The election is not awaiting trustee decryption"), 409
         record = election_record
 
     if data.get("record_hash") != record["record_hash"]:
         return jsonify(error="Trustee result belongs to a different election record"), 400
-    if not verify_decryption(record["shuffle"]["output"], data, public_scheme, record["record_hash"]):
-        return jsonify(error="Trustee decryption proof did not verify"), 400
+    if not verify_partial(record["shuffle"]["output"], data, trustee_manifest, public_scheme, record["record_hash"]):
+        return jsonify(error="Trustee partial-decryption proof did not verify"), 400
 
-    tally = count_votes(data["messages"])
     with ballot_lock:
-        # Another concurrent trustee upload may have finished while we verified.
-        if election_state != "awaiting_trustee":
+        if election_state != "awaiting_trustees":
             return jsonify(error="The election has already been tallied"), 409
-        election_result = {"decryption": data, "tally": tally}
+        index = data["trustee_id"]
+        if index in trustee_partials:
+            return jsonify(error="This trustee has already contributed"), 409
+        trustee_partials[index] = deepcopy(data)
+        received = len(trustee_partials)
+        print(f"Verified trustee {index}: {received} of {REQUIRED} required contributions.", flush=True)
+        if received < REQUIRED:
+            return jsonify(state=election_state, received=received, required=REQUIRED, tally=None), 200
+
+        partials = list(trustee_partials.values())
+        messages = combine_partials(record["shuffle"]["output"], partials, trustee_manifest,
+                                    public_scheme, record["record_hash"])
+        decryption = {"record_hash": record["record_hash"], "partials": partials, "messages": messages}
+        tally = count_votes(messages)
+        election_result = {"decryption": decryption, "tally": tally}
         election_state = "tallied"
     print(f"Tally complete: {tally['counts']} | Invalid ballots: {len(tally['invalid_ballots'])}", flush=True)
-    return jsonify(tally=tally), 200
+    return jsonify(state=election_state, received=received, required=REQUIRED, tally=tally), 200
 
 
 def _load_public_key():
     """Load only the public file produced by the separate trustee script."""
-    global public_key, public_scheme
+    global public_key, public_scheme, trustee_manifest
 
-    file = Path(__file__).resolve().parent.parent / "trustee" / "public_key.bin"
+    folder = Path(__file__).resolve().parent.parent / "trustee" / "threshold"
+    file = folder / "public_key.bin"
     try:
         data = file.read_bytes()
     except OSError as error:
@@ -298,12 +250,16 @@ def _load_public_key():
     # Retain a public-only instance even if another local module used this key.
     public_scheme = ElGamal(scheme.public_key, secret_key=None)
     public_key = base64.b64encode(data).decode("ascii")
+    trustee_manifest = json.loads((folder / "trustees.json").read_text(encoding="utf-8"))
+    if trustee_manifest["public_key"] != public_key:
+        raise ValueError("Public key file differs from the trustee manifest.")
+    validate_manifest(trustee_manifest, public_scheme)
 
 
 if __name__ == "__main__":
     try:
         _load_public_key()
-        _print_authenticated_users()
+        _load_voters()
     except ValueError as error:
         raise SystemExit(f"Startup error: {error}") from error
 

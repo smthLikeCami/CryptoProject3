@@ -10,17 +10,25 @@ Run the complete example from the project root:
 
 The script creates a temporary workspace and fresh keys, starts a background
 HTTP server on an automatically selected local port, and runs the clients and
-trustee in separate processes. It requires permission to bind a local socket.
+trustees in separate processes. It requires permission to bind a local socket.
 It leaves your existing keys, voter file, and running election untouched.
 
 Alice audits and discards a ballot, then prepares a fresh one to cast. Alice,
 Bob, Chet, and Diane each cast once. The runner sends `close` to the server,
-runs trustee decryption, and has each client verify their receipt, the shuffle
-proof, the decryption proof, and the final count. Step numbers and actor labels
+runs trustee 1 and confirms that no plaintext or tally is available. Trustee 2
+then contributes, allowing tallying while trustee 3 stays offline. Each client
+checks its receipt, the shuffle proof, both trustee proofs, and the final count.
+Voter signing keys are also generated in the temporary workspace. Each client
+signs its encrypted submission, and public verification checks the signatures
+and eligible-voter roster as well as the shuffle, decryption, and tally.
+Step numbers and actor labels
 explain each action. The known mock choices and expected counts are public for
 this demonstration; an actual server receives encrypted ballots only.
 
 Edit `DEMO_VOTES` near the top of `mock_election.py` to change the write-ins.
+Adjust `PAUSE_SECONDS` for pauses between phases and client turns, and
+`LINE_PAUSE` for the spacing between output lines. Set both to `0` for a fast
+run. Routine HTTP access logs are hidden; election events and errors remain.
 The default result is `River: 3, Forest: 1`. On completion or failure, started
 processes are stopped and the temporary files are removed.
 
@@ -38,9 +46,45 @@ Generate the election keys once, using the separate trustee script:
 .venv/bin/python trustee/generate_keys.py
 ```
 
-The script writes `trustee/public_key.bin` and `trustee/private_key.bin`.
-The server reads only the public file. The private file stays with the trustee
-and is excluded from Git. Existing key files are never overwritten.
+Generate voter signing keys separately, using the eligible names already in
+`server/voters_list.txt`:
+
+```bash
+.venv/bin/python client/generate_signing_keys.py
+```
+
+This trusted setup writes private Ed25519 keys to
+`client/signing_keys/voter_1.pem`, `voter_2.pem`, and so on, in voter-list order.
+Each private file has owner-only permissions. Deliver only the correct private
+file and the public `voters.json` to each voter, keeping them beside each other.
+The same public roster is registered in `server/voter_keys.json`. Setup refuses
+to overwrite existing signing keys or a registered roster. Signing keys are
+separate from the trustees' ElGamal decryption shares.
+
+The setup operator temporarily controls all signing keys and must be trusted
+not to retain private copies. Public roster copies must be distributed to
+clients and trustees independently, so a malicious server cannot substitute its
+own eligible signing keys.
+
+The script creates `trustee/threshold/` containing:
+
+- `public_key.bin`: the shared public encryption key.
+- `trustees.json`: the public two-of-three policy, share commitments, and IDs.
+- `trustee_1.json`, `trustee_2.json`, `trustee_3.json`: separate private shares,
+  saved with owner-only read/write permissions.
+
+Distribute one private file to each trustee. Distribute the public key and
+public manifest to the server and clients independently. The setup process
+temporarily knows the complete secret but never writes it to a file. It also
+publishes commitments that let anyone check that the three public shares fit
+the same degree-one sharing polynomial. This is trusted setup, not distributed
+key generation; the setup operator must be trusted not to retain the secret.
+
+The server reads only the public files. The threshold directory is excluded
+from Git, and setup refuses to overwrite an existing threshold directory. Old
+`trustee/public_key.bin` and `trustee/private_key.bin` files remain untouched and
+are no longer used by the program. Start a fresh election using threshold keys;
+previous single-trustee ciphertexts cannot be migrated automatically.
 
 For faster demonstration setup, key generation uses 1024 bits and the client
 uses 32-byte text blocks. The requirements also enable GMPY2 acceleration.
@@ -60,12 +104,14 @@ Start the server, then use another terminal to submit a ballot:
 .venv/bin/python client/submit_ballot.py
 ```
 
-Enter a voter name and the password printed by the server, then at most 32
-Unicode characters of write-in text. The client encrypts with the public key and
+Enter a voter name, the path to that voter's private signing file, and at most
+32 Unicode characters of write-in text. The client encrypts with the election public key and
 displays the prepared ciphertext's hash. Then choose `cast` or `audit`:
 
-- `cast` submits that exact ciphertext with the credentials to
-  `POST /submit_ballot`. The plaintext and random exponents are not sent.
+- `cast` signs the election ID, voter name, exact ciphertext's SHA-256 hash,
+  public-roster hash, and a fixed casting-purpose label. It sends the name,
+  election ID, ciphertext, and signature to `POST /submit_ballot`. Neither the
+  private signing key, plaintext, nor encryption randomness is sent.
 - `audit` reveals the plaintext and each block's random exponent in the terminal,
   then checks the saved ciphertext against the public key and both ElGamal
   encryption equations. It also checks the previously displayed hash.
@@ -90,7 +136,9 @@ in `{"hash": "..."}`. The client checks that hash against the ciphertext it sent
 and prints it. A second submission by the same voter receives HTTP 409.
 
 Ballots, proofs, and election results are held in memory. Restarting the server
-clears them, creates a new election ID, and generates new voter passwords.
+clears them and creates a new election ID. Signing keys persist until a new
+trusted setup is deliberately performed. A signature from an earlier election
+is rejected, even when the same signing keys are reused.
 Restart before using this updated ballot format; old variable-width ballots are
 not compatible. Existing key files are preserved.
 
@@ -105,22 +153,26 @@ close
 Closing freezes the accepted bulletin before any mixing work starts. Further
 submissions are rejected. The server randomly permutes whole ballots and
 re-encrypts every block, generates a 128-round cut-and-choose proof, and checks
-that proof. It then prints that it is awaiting the trustee. Run:
+that proof. It then waits for distinct trustees. For example, run these commands
+separately (trustee 3 can replace either trustee):
 
 ```bash
-.venv/bin/python trustee/decrypt_ballots.py
+.venv/bin/python trustee/decrypt_ballots.py --trustee 1
+.venv/bin/python trustee/decrypt_ballots.py --trustee 2
 ```
 
-The trustee fetches `GET /election`, checks the local public key against the
-record, checks receipt hashes, and verifies the shuffle proof. Only then does
-it load the private key and decrypt. TNO caches schemes by public key, so the
-script clears the public-only cache before loading the private file.
+Each trustee fetches `GET /election`, checks the locally trusted public key and
+manifest, checks receipt hashes, and verifies the shuffle proof. Only then does
+it load its own private share. It produces a partial decryption factor for each
+block and a Chaum-Pedersen proof that these factors use the same exponent as its
+public share. It never opens another trustee's private file or uploads a share.
 
-The trustee uploads the plaintext block values and a decryption proof to
-`POST /trustee/tally`. The proof demonstrates that the same private exponent
-behind the election public key explains every decryption. The private key is
-never sent. The server checks the proof and the frozen record hash before
-decoding write-ins and publishing counts. Repeat tally uploads are rejected.
+Trustees upload factors and proofs to `POST /trustee/partial_decryption`. After
+one valid contribution, the server remains in `awaiting_trustees`, publishes
+progress, and has no plaintext or tally. Two distinct verified contributions
+allow Lagrange interpolation of the decryption factors. The complete secret key
+is never reconstructed. Duplicate, unknown, forged, and replayed contributions
+are rejected. The old single-trustee `/trustee/tally` endpoint no longer exists.
 
 Counts use exact text: `Alice` and `alice` are different write-ins, whitespace
 is preserved, and the empty string is counted as its own entry. Plaintexts with
@@ -128,8 +180,18 @@ invalid UTF-8, padding, length, or block encoding are recorded by shuffled index
 in `invalid_ballots`. They are not silently assigned to a candidate.
 
 `GET /election` publishes the state, the frozen input ballots and receipt hashes,
-the shuffled ciphertexts and proof, and, after tallying, the decryption proof and
-counts. It publishes no voter names or passwords.
+the shuffled ciphertexts and proof, and, after tallying, both partial-decryption
+proofs, combined plaintexts, and counts. `trustee_progress` shows the required
+and received contribution counts and trustee IDs. As selected for this design,
+the frozen input record also publishes voter names, signatures, and the public
+signing-key roster. These identify who authorized each encrypted input, not its
+plaintext choice. No private signing keys or decryption shares are published.
+
+Password authentication and the old `/authenticate` endpoint have been removed.
+The server verifies each ballot signature against the pre-registered public
+key and accepts at most one ballot per voter. A client-supplied public key does
+not replace the registered key. Trustees check these public authorizations
+against their trusted roster before contributing partial decryptions.
 
 To verify a completed election with your saved receipt:
 
@@ -137,11 +199,15 @@ To verify a completed election with your saved receipt:
 .venv/bin/python client/verify.py --receipt YOUR_BALLOT_HASH
 ```
 
-The verifier uses the local `trustee/public_key.bin` as its trusted public key.
-For another deployment, use `--server URL --public-key PATH` and obtain that
-public key independently. It never needs a voter password or private key.
+The verifier uses `trustee/threshold/public_key.bin` and the adjacent
+`trustees.json` as its trust anchors. For another deployment, use
+`--server URL --public-key PATH` and independently obtain both public files,
+keeping `trustees.json` beside the key file. It never needs a password or share.
+The verifier also loads the independently trusted voter roster from
+`client/signing_keys/voters.json`; use `--voters PATH` for another copy.
 It checks the frozen input hashes, your receipt's inclusion, the entire shuffle
-proof, the trustee decryption proof, and the recomputed tally including invalid
+proof, voter signatures and unique eligible identities, trustee IDs and proofs,
+the combination of their factors, and the recomputed tally including invalid
 ballot indices. Without `--receipt`, it checks public evidence but explicitly
 reports that individual inclusion was not checked.
 
@@ -173,19 +239,28 @@ and all intermediate commitments. The real input-to-output permutation is not
 published. The idea follows the cut-and-choose approach to shuffle proofs;
 see [Sako and Kilian's paper](https://doi.org/10.1007/3-540-49264-X_32).
 
-The decryption proof uses 128 binary equality-of-discrete-log challenges. This
-avoids division in the composite-order `p-1` group used by TNO. Both protocols
-require exactly 128 rounds; verifiers reject shortened or modified transcripts.
-This experimental proof code is written for learning and has not been reviewed
-as a production cryptographic implementation.
+Threshold operations use the prime-order quadratic-residue subgroup of order
+`q = (p-1)/2`. Setup squares TNO's original full-order generator. Shares use
+`s_i = x + a*i (mod q)`, with public commitments to `x` and `a`. Each trustee
+computes `d_i = c_1 ** s_i (mod p)` and proves equality of discrete logs.
+Combining any two valid factors with Lagrange coefficients gives `c_1 ** x`,
+which removes the encryption mask from `c_2`. One factor is insufficient.
+
+Shuffle proofs retain exactly 128 cut-and-choose rounds. Partial-decryption
+proofs use Fiat-Shamir challenges bound to the entire frozen record, public
+trustee manifest, trustee ID, ciphertexts, factors, and commitments. This
+experimental proof code is written for learning and has not been reviewed as a
+production cryptographic implementation.
 
 There is one mixing stage in the server. It knows its own shuffle, so anonymity
 against the server would require additional independently operated mixing
-stages with at least one honest operator. The trustee has the complete private
-key and must be trusted not to decrypt original ballots. Threshold trustees are
-not implemented. Proofs cover the frozen published record; they do not establish
-that a dishonest server published every accepted ballot, or authenticated every
-input correctly. Voters still need to check their receipts in that record.
+stages with at least one honest operator. Any two colluding trustees can decrypt
+original ballots if they obtain them. The demo uses separate processes under
+one operating-system user; real trustees must hold their share files on
+independently controlled systems. Signatures make input authorization publicly
+checkable against the trusted roster. Proofs cover the frozen published record;
+they do not establish that a dishonest server published every accepted ballot.
+Voters still need to check their receipts in that record.
 
 The server validates ciphertext structure, width, group elements, and key, but
 clients do not yet prove knowledge of the encrypted vote or its valid encoding.

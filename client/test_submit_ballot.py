@@ -6,20 +6,27 @@ import hashlib
 from io import StringIO
 import json
 from math import isqrt
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from tno.mpc.communication import Serialization
 from tno.mpc.encryption_schemes.elgamal.elgamal import ElGamal, ElGamalCipherText
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import submit_ballot as client
+from server.shuffle import read_ballot
+from server.threshold import combine_partials, create_partial, create_setup
+from server.authentication import ROSTER_VERSION, public_key_text, verify_signature
 
 
 class AuditTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Small, temporary key for tests only; never used by the election.
-        cls.scheme = ElGamal.from_security_parameter(bits=600)
+        cls.scheme, cls.manifest, cls.shares = create_setup(bits=600)
 
     def test_audit_and_decryption_preserve_text(self):
         for vote in ("", "Alice", "\x00hello", "é☑" * 16, "😀" * 32):
@@ -31,9 +38,11 @@ class AuditTests(unittest.TestCase):
                 # Independently decode to catch mistakes shared by preparation
                 # and auditing, including Unicode split across text blocks.
                 recovered = b""
-                for block in json.loads(ballot):
-                    ciphertext = Serialization.unpack(base64.b64decode(block))[1]
-                    number = isqrt(self.scheme.decrypt(ciphertext))
+                rows = [[[str(value) for value in pair] for pair in read_ballot(ballot, self.scheme)]]
+                partials = [create_partial(rows, share, self.manifest, self.scheme, digest) for share in self.shares[:2]]
+                messages = combine_partials(rows, partials, self.manifest, self.scheme, digest)
+                for message in messages[0]:
+                    number = isqrt(int(message))
                     data = number.to_bytes(33, "big")
                     self.assertEqual(data[0], 1)
                     recovered += data[1:]
@@ -78,7 +87,10 @@ class AuditTests(unittest.TestCase):
         public_scheme = ElGamal(self.scheme.public_key, None)
         public_data = Serialization.pack(public_scheme, msg_id="", use_pickle=False)
         response = Mock()
-        response.json.return_value = {"public_key": base64.b64encode(public_data).decode("ascii")}
+        signing_key = Ed25519PrivateKey.generate()
+        roster = {"version": ROSTER_VERSION, "voters": [{"name": "voter", "public_key": public_key_text(signing_key)}]}
+        response.json.return_value = {"public_key": base64.b64encode(public_data).decode("ascii"),
+                                      "election_id": "audit-test", "voters": roster}
         prepared = []
         original_prepare = client._prepare_ballot
 
@@ -88,28 +100,34 @@ class AuditTests(unittest.TestCase):
             return ballot, randomness
 
         def accept(url, json, timeout):
-            self.assertEqual(set(json), {"name", "password", "ballot"})
+            self.assertEqual(set(json), {"name", "election_id", "signature", "ballot"})
+            self.assertTrue(verify_signature(json["election_id"], json["name"], json["ballot"], json["signature"], roster))
             result = Mock(status_code=200)
             result.json.return_value = {"hash": hashlib.sha256(json["ballot"].encode()).hexdigest()}
             return result
 
         with (
+            tempfile.TemporaryDirectory() as folder,
             patch.object(client.requests, "get", return_value=response),
             patch.object(client.requests, "post", side_effect=accept) as post,
             patch.object(client, "_prepare_ballot", side_effect=prepare),
             patch("builtins.input", return_value="audit"),
             redirect_stdout(StringIO()),
         ):
-            self.assertIsNone(client._submit_ballot("Alice", "voter", "password"))
+            private_file = Path(folder) / "key.pem"
+            private_file.write_bytes(signing_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                              serialization.NoEncryption()))
+            private_file.with_name("voters.json").write_text(json.dumps(roster))
+            self.assertIsNone(client._submit_ballot("Alice", "voter", private_file))
             post.assert_not_called()
 
             # A failed audit also must not submit anything.
             with patch.object(client, "_audit_ballot", return_value=False):
-                self.assertIsNone(client._submit_ballot("Alice", "voter", "password"))
+                self.assertIsNone(client._submit_ballot("Alice", "voter", private_file))
                 post.assert_not_called()
 
             with patch("builtins.input", return_value="cast"):
-                self.assertIsNotNone(client._submit_ballot("Alice", "voter", "password"))
+                self.assertIsNotNone(client._submit_ballot("Alice", "voter", private_file))
                 post.assert_called_once()
 
         self.assertEqual(len(set(prepared)), 3)

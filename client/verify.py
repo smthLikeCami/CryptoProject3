@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import json
 from pathlib import Path
 import sys
 
@@ -11,10 +12,12 @@ from tno.mpc.encryption_schemes.elgamal.elgamal import ElGamal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.shuffle import (BALLOT_FORMAT, count_votes, election_rows, hash_record,
-                            validate_key, verify_decryption, verify_shuffle)
+                            verify_shuffle)
+from server.threshold import validate_manifest, verify_threshold_decryption
+from server.authentication import verify_authorizations
 
 
-def verify_election(election, public_data, receipt=None, report=print):
+def verify_election(election, public_data, receipt=None, report=print, trustees=None, voters=None):
     """Verify public evidence; never request a voter password or private key."""
     if not isinstance(election, dict) or election.get("state") != "tallied":
         raise ValueError("The election has not finished tallying.")
@@ -32,8 +35,13 @@ def verify_election(election, public_data, receipt=None, report=print):
     if not isinstance(loaded, ElGamal):
         raise ValueError("Expected an ElGamal public key.")
     scheme = ElGamal(loaded.public_key, secret_key=None)
-    validate_key(scheme)
+    if trustees is None or hash_record(context["trustees"]) != hash_record(trustees):
+        raise ValueError("The published trustees differ from the trusted trustee manifest.")
+    validate_manifest(trustees, scheme)
+    if trustees["public_key"] != context["public_key"]:
+        raise ValueError("Trustee manifest differs from the published election key.")
     report("PASS: the election uses the trusted public key; no private key is needed.")
+    report("PASS: public share commitments enforce a two-of-three trustee policy.")
 
     if context["ballot_format"] != BALLOT_FORMAT:
         raise ValueError("Unsupported ballot format.")
@@ -46,6 +54,10 @@ def verify_election(election, public_data, receipt=None, report=print):
 
     rows = election_rows(context, scheme)
     report(f"PASS: all {len(rows)} input receipt hashes and ciphertext formats check out.")
+    if voters is None:
+        raise ValueError("A trusted voter public-key roster is required.")
+    verify_authorizations(context, voters)
+    report("PASS: every input has a valid Ed25519 signature from a distinct eligible voter.")
     if receipt is not None:
         if not any(entry["hash"] == receipt for entry in context["ballots"]):
             raise ValueError("Your receipt is missing from the frozen input bulletin.")
@@ -61,10 +73,10 @@ def verify_election(election, public_data, receipt=None, report=print):
     decryption = result["decryption"]
     if decryption["record_hash"] != digest:
         raise ValueError("The decryption belongs to another election record.")
-    report("Checking the trustee's public decryption proof...")
-    if not verify_decryption(record["shuffle"]["output"], decryption, scheme, digest):
-        raise ValueError("The trustee's decryption proof is invalid.")
-    report("PASS: the plaintext blocks match the shuffled ciphertexts under this public key.")
+    report("Checking distinct trustee proofs and combining their public decryption factors...")
+    if not verify_threshold_decryption(record["shuffle"]["output"], decryption, trustees, scheme, digest):
+        raise ValueError("The threshold decryption proof is invalid.")
+    report("PASS: at least two valid trustee contributions reproduce the published plaintexts.")
 
     tally = count_votes(decryption["messages"])
     if hash_record(tally) != hash_record(result["tally"]):
@@ -74,24 +86,29 @@ def verify_election(election, public_data, receipt=None, report=print):
     return tally
 
 
-def verify_server(server_url, public_file, receipt=None, report=print):
+def verify_server(server_url, public_file, receipt=None, report=print, voters_file=None):
     """Download evidence over HTTP and verify against a local public key file."""
     public_data = Path(public_file).read_bytes()
+    trustees = json.loads(Path(public_file).with_name("trustees.json").read_text(encoding="utf-8"))
+    if voters_file is None:
+        voters_file = Path(__file__).resolve().parent / "signing_keys" / "voters.json"
+    voters = json.loads(Path(voters_file).read_text(encoding="utf-8"))
     report("Downloading the published election record over HTTP...")
     response = requests.get(f"{server_url.rstrip('/')}/election", timeout=60)
     response.raise_for_status()
-    return verify_election(response.json(), public_data, receipt, report)
+    return verify_election(response.json(), public_data, receipt, report, trustees, voters)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", default="http://127.0.0.1:5000")
     parser.add_argument("--public-key", type=Path,
-                        default=Path(__file__).resolve().parent.parent / "trustee" / "public_key.bin")
+                        default=Path(__file__).resolve().parent.parent / "trustee" / "threshold" / "public_key.bin")
     parser.add_argument("--receipt", help="The SHA-256 receipt printed when your ballot was cast")
+    parser.add_argument("--voters", type=Path, help="Independently trusted voter public-key roster")
     args = parser.parse_args()
 
     try:
-        verify_server(args.server, args.public_key, args.receipt)
+        verify_server(args.server, args.public_key, args.receipt, voters_file=args.voters)
     except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, requests.RequestException) as error:
         raise SystemExit(f"Verification failed: {error}") from error

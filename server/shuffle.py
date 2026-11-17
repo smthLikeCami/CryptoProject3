@@ -1,4 +1,4 @@
-"""Readable, experimental ElGamal shuffle and decryption proofs.
+"""Readable, experimental ElGamal shuffle proofs and padded ballot encoding.
 
 Each of 128 cut-and-choose rounds opens one of two links through a fresh
 intermediate shuffle. Never publish both links: that would reveal the shuffle.
@@ -38,15 +38,15 @@ def _challenges(domain, statement, commitments):
 
 
 def validate_key(scheme):
-    """Require the safe-prime, full-order group produced by TNO's key generator."""
+    """Require a prime-order subgroup, allowing Shamir interpolation modulo q."""
     key = scheme.public_key
     prime = key.p
     half = (prime - 1) // 2
     if not 600 <= prime.bit_length() <= 8192 or not is_prime(prime) or not is_prime(half):
         raise ValueError("Expected a safe-prime ElGamal key of at least 600 bits.")
-    if not 1 < key.g < prime or pow_mod(key.g, half, prime) == 1 or pow_mod(key.g, 2, prime) == 1:
-        raise ValueError("The ElGamal generator must have order p - 1.")
-    if not 1 < key.h < prime or pow_mod(key.h, 2, prime) == 1:
+    if not 1 < key.g < prime or pow_mod(key.g, half, prime) != 1:
+        raise ValueError("The ElGamal generator must have prime order q.")
+    if not 1 < key.h < prime or pow_mod(key.h, half, prime) != 1:
         raise ValueError("Invalid ElGamal public key.")
 
 
@@ -126,7 +126,10 @@ def read_rows(rows, scheme):
         for pair in row:
             if not isinstance(pair, list) or len(pair) != 2:
                 raise ValueError("Expected an ElGamal pair.")
-            ballot.append([_number(value, prime, minimum=1) for value in pair])
+            values = [_number(value, prime, minimum=1) for value in pair]
+            if any(pow_mod(value, (prime - 1) // 2, prime) != 1 for value in values):
+                raise ValueError("Ciphertext is outside the election subgroup.")
+            ballot.append(values)
         result.append(ballot)
     return result
 
@@ -163,7 +166,7 @@ def create_shuffle(rows, scheme, context):
     """Return a re-encrypted permutation and a public cut-and-choose proof."""
     rows = read_rows(rows, scheme)
     size = len(rows)
-    order = scheme.public_key.p - 1
+    order = (scheme.public_key.p - 1) // 2
     permutation = _random_order(size)
     offsets = _random_offsets(size, order)
     output = _reencrypt(rows, permutation, offsets, scheme)
@@ -228,7 +231,7 @@ def verify_shuffle(rows, proof, scheme, context):
             for row in values:
                 if not isinstance(row, list) or len(row) != BLOCK_COUNT:
                     return False
-                offsets.append([_number(value, scheme.public_key.p - 1) for value in row])
+                offsets.append([_number(value, (scheme.public_key.p - 1) // 2) for value in row])
             reference = rows if bit == 0 else output
             if _reencrypt(reference, permutation, offsets, scheme) != intermediate:
                 return False
@@ -249,82 +252,6 @@ def election_rows(context, scheme):
         rows.append(_wire([read_ballot(entry["ballot"], scheme)])[0])
     return rows
 
-
-def _read_messages(messages, count, prime):
-    if not isinstance(messages, list) or len(messages) != count:
-        raise ValueError("Incorrect plaintext count.")
-    result = []
-    for row in messages:
-        if not isinstance(row, list) or len(row) != BLOCK_COUNT:
-            raise ValueError("Incorrect plaintext width.")
-        result.append([_number(value, prime, minimum=1) for value in row])
-    return result
-
-
-def create_decryption(rows, scheme, context):
-    """Trustee-only: decrypt and prove equality of discrete logs with binary challenges.
-
-    Binary challenges avoid division modulo p-1, which is composite in TNO's
-    full-order group. The same private key must explain every decrypted block.
-    """
-    rows = read_rows(rows, scheme)
-    key = scheme.public_key
-    order = key.p - 1
-    if scheme.secret_key is None:
-        raise ValueError("Decryption requires the trustee's private key.")
-    secret = scheme.secret_key.x
-    if pow_mod(key.g, secret, key.p) != key.h:
-        raise ValueError("Private key does not match the election public key.")
-    messages = [
-        [str(scheme.decrypt(ElGamalCipherText(tuple(pair), scheme)) % key.p) for pair in row]
-        for row in rows
-    ]
-    nonces = [secrets.randbelow(order) for _ in range(PROOF_ROUNDS)]
-    commitments = [
-        {"generator": str(pow_mod(key.g, nonce, key.p)),
-         "blocks": [[str(pow_mod(pair[0], nonce, key.p)) for pair in row] for row in rows]}
-        for nonce in nonces
-    ]
-    statement = {"context": context, "ciphertexts": _wire(rows), "messages": messages,
-                 "key": [str(key.p), str(key.g), str(key.h)]}
-    bits = _challenges("decryption-binary-log-equality-v1", statement, commitments)
-    responses = [str((nonce + bit * secret) % order) for nonce, bit in zip(nonces, bits)]
-    return {"messages": messages, "proof": {"commitments": commitments, "responses": responses}}
-
-
-def verify_decryption(rows, result, scheme, context):
-    """Check the trustee's decryption proof without receiving the private key."""
-    try:
-        rows = read_rows(rows, scheme)
-        key = scheme.public_key
-        messages = _read_messages(result["messages"], len(rows), key.p)
-        commitments = result["proof"]["commitments"]
-        responses = result["proof"]["responses"]
-        if len(commitments) != PROOF_ROUNDS or len(responses) != PROOF_ROUNDS:
-            return False
-        statement = {"context": context, "ciphertexts": _wire(rows), "messages": result["messages"],
-                     "key": [str(key.p), str(key.g), str(key.h)]}
-        bits = _challenges("decryption-binary-log-equality-v1", statement, commitments)
-        factors = [[pair[1] * pow(message, -1, key.p) % key.p for pair, message in zip(row, values)]
-                   for row, values in zip(rows, messages)]
-        for bit, commitment, response in zip(bits, commitments, responses):
-            exponent = _number(response, key.p - 1)
-            generator = _number(commitment["generator"], key.p, minimum=1)
-            blocks = commitment["blocks"]
-            if pow_mod(key.g, exponent, key.p) != generator * (key.h if bit else 1) % key.p:
-                return False
-            if not isinstance(blocks, list) or len(blocks) != len(rows):
-                return False
-            for row, values, divisors in zip(rows, blocks, factors):
-                if not isinstance(values, list) or len(values) != BLOCK_COUNT:
-                    return False
-                for pair, value, divisor in zip(row, values, divisors):
-                    value = _number(value, key.p, minimum=1)
-                    if pow_mod(pair[0], exponent, key.p) != value * (divisor if bit else 1) % key.p:
-                        return False
-        return True
-    except (ValueError, TypeError, KeyError, IndexError, AttributeError):
-        return False
 
 
 def count_votes(messages):
