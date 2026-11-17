@@ -22,7 +22,7 @@ class AuditTests(unittest.TestCase):
         cls.scheme = ElGamal.from_security_parameter(bits=600)
 
     def test_audit_and_decryption_preserve_text(self):
-        for vote in ("", "Alice", "\x00hello", "é☑" * 30):
+        for vote in ("", "Alice", "\x00hello", "é☑" * 16, "😀" * 32):
             with self.subTest(vote=vote):
                 ballot, randomness = client._prepare_ballot(vote, self.scheme)
                 digest = hashlib.sha256(ballot.encode()).hexdigest()
@@ -34,16 +34,24 @@ class AuditTests(unittest.TestCase):
                 for block in json.loads(ballot):
                     ciphertext = Serialization.unpack(base64.b64decode(block))[1]
                     number = isqrt(self.scheme.decrypt(ciphertext))
-                    data = number.to_bytes((number.bit_length() + 7) // 8, "big")
+                    data = number.to_bytes(33, "big")
                     self.assertEqual(data[0], 1)
                     recovered += data[1:]
 
-                self.assertEqual(recovered.decode("utf-8"), vote)
+                size = int.from_bytes(recovered[:2], "big")
+                self.assertEqual(recovered[2 : 2 + size].decode("utf-8"), vote)
+                self.assertFalse(any(recovered[2 + size :]))
+                self.assertEqual(len(json.loads(ballot)), 5)
+
+    def test_write_in_length_limit(self):
+        with self.assertRaises(ValueError):
+            client._prepare_ballot("a" * 33, self.scheme)
 
     def test_audit_rejects_changed_openings(self):
         ballot, randomness = client._prepare_ballot("Alice", self.scheme)
         digest = hashlib.sha256(ballot.encode()).hexdigest()
-        changed = [randomness[0] + 1]
+        changed = list(randomness)
+        changed[0] += 1
 
         self.assertFalse(client._audit_ballot("Bob", ballot, randomness, self.scheme, digest))
         self.assertFalse(client._audit_ballot("Alice", ballot, changed, self.scheme, digest))

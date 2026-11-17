@@ -4,30 +4,26 @@ import base64
 from getpass import getpass
 import hashlib
 import json
+from pathlib import Path
 import secrets
+import sys
 
 import requests
 from tno.mpc.communication import Serialization
 from tno.mpc.encryption_schemes.elgamal.elgamal import ElGamal, ElGamalCipherText
 from tno.mpc.encryption_schemes.templates.random_sources import ContextlessSource
 
+# Share the padded ballot format with the server and trustee scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from server.shuffle import encode_vote
+
 
 server_url = "http://127.0.0.1:5000"
 
 
 def _encode_vote(vote):
-    """Turn UTF-8 text into squared integers that fit the demo election key."""
-    text = vote.encode("utf-8")
-    messages = []
-
-    # Keep 32-byte blocks for the existing 1024-bit demonstration key.
-    # The prefix preserves empty text and leading zero bytes.
-    for start in range(0, max(1, len(text)), 32):
-        block = text[start : start + 32]
-        number = int.from_bytes(b"\x01" + block, "big")
-        messages.append(number * number)
-
-    return messages
+    """Encode up to 32 characters in five blocks, hiding the write-in length."""
+    return encode_vote(vote)
 
 
 def _prepare_ballot(vote, scheme):
@@ -179,6 +175,6 @@ def _submit_ballot(vote, username, password):
 if __name__ == "__main__":
     username = input("Voter name: ")
     password = getpass("Password: ")
-    vote = input("Vote (write-in text): ")
+    vote = input("Vote (write-in text, at most 32 characters): ")
 
     _submit_ballot(vote, username, password)
